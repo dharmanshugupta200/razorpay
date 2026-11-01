@@ -1,99 +1,81 @@
 <?php
-session_start();
+// Razorpay checkout posts here after a successful payment. We never trust it until the signature checks out.
+require_once __DIR__ . '/includes/payments.php';
 
-require_once 'config.php';
-require 'razorpay-php/Razorpay.php';
+$user = require_login();
 
-use Razorpay\Api\Api;
-
-$api_key = $razorpay_config['api_key'];
-$api_secret = $razorpay_config['api_secret'];
-
-if (empty($api_key) || empty($api_secret) || strpos($api_key, 'rzp_') !== 0) {
-    die('Razorpay API key/secret is missing or invalid. Update the values in config.php with your live/test credentials from the Razorpay Dashboard.');
+if ($_SERVER['REQUEST_METHOD'] !== 'POST' || !csrf_valid($_POST['csrf'] ?? null)) {
+    flash('Invalid request.', 'error');
+    redirect('dashboard.php');
 }
 
-$api = new Api($api_key, $api_secret);
+$paymentId = (string)($_POST['razorpay_payment_id'] ?? '');
+$orderId   = (string)($_POST['razorpay_order_id'] ?? '');
+$signature = (string)($_POST['razorpay_signature'] ?? '');
 
-$payment_id = $_POST['razorpay_payment_id'] ?? '';
-$order_id = $_POST['razorpay_order_id'] ?? '';
-$razorpay_signature = $_POST['razorpay_signature'] ?? '';
-$payment_succeeded = false;
-$session_order_id = $_SESSION['razorpay_order_id'] ?? '';
+$row = $orderId !== '' ? payment_by_order($orderId) : null;
+if (!$row || (int)$row['user_id'] !== (int)$user['id']) {
+    flash('We could not match that payment to your account.', 'error');
+    redirect('dashboard.php');
+}
 
-if (
-    $order_id !== ''
-    && $session_order_id !== ''
-    && hash_equals($session_order_id, $order_id)
-) {
-    if (!empty($_SESSION['payment_succeeded'])) {
-        $payment_succeeded = true;
-    } elseif ($payment_id !== '' && $razorpay_signature !== '') {
+// 1) Signature check: proves Razorpay (not an attacker) produced this result.
+try {
+    razorpay()->utility->verifyPaymentSignature([
+        'razorpay_order_id'   => $orderId,
+        'razorpay_payment_id' => $paymentId,
+        'razorpay_signature'  => $signature,
+    ]);
+} catch (\Razorpay\Api\Errors\SignatureVerificationError $e) {
+    payment_transition((int)$row['id'], 'failed', 'signature_mismatch', ['posted' => $_POST], [
+        'razorpay_payment_id' => $paymentId,
+        'error_code'          => 'SIGNATURE_MISMATCH',
+        'error_description'   => 'Payment signature could not be verified',
+    ]);
+    flash('Payment could not be verified, so it was not accepted. You can try again.', 'error');
+    redirect('dashboard.php');
+}
+
+// 2) Ask Razorpay for the real payment record and compare it with what we expected.
+$gateway = fetch_gateway_payment($paymentId);
+if ($gateway) {
+    // Test-mode accounts sometimes leave payments "authorized"; capture so the money is actually taken.
+    if (($gateway['status'] ?? '') === 'authorized') {
         try {
-            $api->utility->verifyPaymentSignature([
-                'razorpay_order_id' => $order_id,
-                'razorpay_payment_id' => $payment_id,
-                'razorpay_signature' => $razorpay_signature
+            razorpay()->payment->fetch($paymentId)->capture([
+                'amount'   => (int)$row['amount'],
+                'currency' => $row['currency'],
             ]);
-            $payment_succeeded = true;
-            $_SESSION['payment_succeeded'] = true;
-        } catch (\Razorpay\Api\Errors\SignatureVerificationError $e) {
-            $payment_succeeded = false;
+            $gateway = fetch_gateway_payment($paymentId) ?? $gateway;
+        } catch (Throwable $e) {
+            $gateway['capture_error'] = $e->getMessage();
         }
+    }
+
+    $mismatch = ($gateway['order_id'] ?? '') !== $orderId
+             || (int)($gateway['amount'] ?? 0) !== (int)$row['amount']
+             || !in_array($gateway['status'] ?? '', ['captured', 'authorized'], true);
+
+    if ($mismatch) {
+        payment_transition((int)$row['id'], 'failed', 'gateway_mismatch', ['gateway' => $gateway], [
+            'razorpay_payment_id' => $paymentId,
+            'error_code'          => 'GATEWAY_MISMATCH',
+            'error_description'   => 'Amount, order or status did not match what we expected',
+        ]);
+        flash('The payment details did not match our records, so it was not accepted.', 'error');
+        redirect('dashboard.php');
     }
 }
 
-?>
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title><?php echo $payment_succeeded ? 'Payment successful' : 'Payment failed'; ?></title>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            background: #f8f9fa;
-            margin: 0;
-            min-height: 100vh;
-            display: grid;
-            place-items: center;
-        }
-        .container {
-            max-width: 420px;
-            width: calc(100% - 48px);
-            padding: 32px;
-            text-align: center;
-            background: #fff;
-            border-radius: 10px;
-            box-shadow: 0 0 20px rgba(0, 0, 0, 0.1);
-        }
-        h1.success {
-            color: #27833f;
-        }
-        h1.failure {
-            color: #c62828;
-        }
-        a {
-            display: inline-block;
-            padding: 12px 22px;
-            color: #fff;
-            background: #3395ff;
-            border-radius: 5px;
-            text-decoration: none;
-        }
-    </style>
-</head>
-<body>
-    <main class="container">
-        <?php if ($payment_succeeded): ?>
-            <h1 class="success">Payment successful</h1>
-            <p>Thank you. Your payment was verified successfully.</p>
-        <?php else: ?>
-            <h1 class="failure">Payment failed</h1>
-            <p>Your payment could not be verified. You can try again.</p>
-            <a href="index.php">Retry payment</a>
-        <?php endif; ?>
-    </main>
-</body>
-</html>
+// 3) All good: record success (or "duplicate" if the user somehow already paid).
+$result = payment_transition((int)$row['id'], 'success', 'payment_verified', [
+    'posted'  => ['razorpay_payment_id' => $paymentId, 'razorpay_order_id' => $orderId, 'razorpay_signature' => $signature],
+    'gateway' => $gateway,
+], ['razorpay_payment_id' => $paymentId]);
+
+if ($result['status'] === 'duplicate') {
+    flash('You had already paid, so this second payment was flagged for a refund.', 'warn');
+} else {
+    flash('Payment successful. Thank you!', 'ok');
+}
+redirect('dashboard.php');
