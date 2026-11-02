@@ -137,6 +137,7 @@ page_header('Payment');
 <?php endif; ?>
 
 <?php if ($attempts): ?>
+  <button>Reset All Payment</button>
   <!-- CONDITION 3: every attempt and its stored response -->
   <div class="card">
     <h2>Payment history <span class="muted">(<?= count($attempts) ?> attempt<?= count($attempts) === 1 ? '' : 's' ?>, <?= (int)$totalFailed ?> failed)</span></h2>
